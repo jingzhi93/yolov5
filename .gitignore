@@ -254,3 +254,5 @@ com_crashlytics_export_strings.xml
 crashlytics.properties
 crashlytics-build.properties
 fabric.properties
+saved_data_loader/train_dataset.pth
+saved_data_loader/val_dataset.pth
