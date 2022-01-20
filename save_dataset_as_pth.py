@@ -344,9 +344,4 @@ def run(**kwargs):
 
 if __name__ == "__main__":
     opt = parse_opt()
-    opt.img = 640
-    opt.batch = 16
-    opt.epochs = 1
-    opt.data = "testkits.yaml"
-    opt.weights = "yolov5s.pt"
     main(opt)
