@@ -168,7 +168,7 @@ def create_loaded_dataloader(path, imgsz, batch_size, stride, single_cls=False, 
     # save dataset
     train_val_test = os.path.split(path.lower())[-1]
     # save dataset
-    LOGGER.info(f"Loading dataset pt from saved_data_loader/{train_val_test}_dataset.pth")
+    LOGGER.info(f"Loading dataset pt from saved_data_loader/{train_val_test}_dataset.pth to saved_data_loader/{train_val_test}_dataset.pth")
     dataset = torch.load(f"saved_data_loader/{train_val_test}_dataset.pth")
 
     batch_size = min(batch_size, len(dataset))
