@@ -31,6 +31,7 @@ from torch.cuda import amp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import SGD, Adam, AdamW, lr_scheduler
 from tqdm import tqdm
+import configparser
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -633,4 +634,15 @@ def run(**kwargs):
 
 if __name__ == "__main__":
     opt = parse_opt()
+    config = configparser.ConfigParser()
+    config.read(r"train.cfg")
+    default_conf = dict(config.items('DEFAULT'))
+    opt.imgsz = int(default_conf["imgsize"])
+    opt.batch = int(default_conf["batch"])
+    opt.epochs = int(default_conf["epochs"])
+    opt.data = str(default_conf["data"])
+    opt.weights = str(default_conf["weights"])
+    if torch.cuda.is_available():
+        opt.device = int(default_conf["device"])
+    opt.workers = int(default_conf["workers"])
     main(opt)

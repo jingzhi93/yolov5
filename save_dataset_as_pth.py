@@ -21,6 +21,8 @@ import time
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
+import configparser
+import pickle
 
 import numpy as np
 import torch
@@ -31,6 +33,7 @@ from torch.cuda import amp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import SGD, Adam, AdamW, lr_scheduler
 from tqdm import tqdm
+
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -44,7 +47,7 @@ from models.yolo import Model
 from utils.autoanchor import check_anchors
 from utils.autobatch import check_train_batch_size
 from utils.callbacks import Callbacks
-from utils.datasets import create_save_dataloader, create_loaded_dataloader
+from utils.datasets import create_dataloader
 from utils.downloads import attempt_download
 from utils.general import (LOGGER, check_dataset, check_file, check_git_status, check_img_size, check_requirements,
                            check_suffix, check_yaml, colorstr, get_latest_run, increment_path, init_seeds,
@@ -58,8 +61,7 @@ from utils.plots import plot_evolve, plot_labels
 from utils.torch_utils import EarlyStopping, ModelEMA, de_parallel, select_device, torch_distributed_zero_first
 
 LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
-# RANK = int(os.getenv('RANK', -1))
-RANK = -1
+RANK = int(os.getenv('RANK', -1))
 WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
 
 
@@ -219,31 +221,106 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     if opt.sync_bn and cuda and RANK != -1:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
         LOGGER.info('Using SyncBatchNorm()')
+     
+     #create saved foler   
+    for folder in ["imgs", "targets", "paths", "shapes"]:
+        os.makedirs(f"saved_tensors/train/{folder}/", exist_ok=True)
+        os.makedirs(f"saved_tensors/val/{folder}/", exist_ok=True)
+    
 
     # Trainloader
-    LOGGER.info(f'Save data from {train_path} as pt')
-    train_loader, dataset = create_save_dataloader(train_path, imgsz, batch_size // WORLD_SIZE, gs, single_cls,
+    train_loader, dataset = create_dataloader(train_path, imgsz, batch_size // WORLD_SIZE, gs, single_cls,
                                               hyp=hyp, augment=True, cache=opt.cache, rect=opt.rect, rank=LOCAL_RANK,
                                               workers=workers, image_weights=opt.image_weights, quad=opt.quad,
                                               prefix=colorstr('train: '), shuffle=True)
+    torch.save(dataset, "saved_tensors/train/dataset.pth")
     mlc = int(np.concatenate(dataset.labels, 0)[:, 0].max())  # max label class
     nb = len(train_loader)  # number of batches
     assert mlc < nc, f'Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc - 1}'
 
-
     # Process 0
-    print(RANK)
     if RANK in [-1, 0]:
-        LOGGER.info(f'Save data from {val_path}')
-        create_save_dataloader(val_path, imgsz, batch_size // WORLD_SIZE * 2, gs, single_cls,
+        val_loader = create_dataloader(val_path, imgsz, batch_size // WORLD_SIZE * 2, gs, single_cls,
                                        hyp=hyp, cache=None if noval else opt.cache, rect=True, rank=-1,
                                        workers=workers, pad=0.5,
                                        prefix=colorstr('val: '))[0]
+
+        if not resume:
+            labels = np.concatenate(dataset.labels, 0)
+            # c = torch.tensor(labels[:, 0])  # classes
+            # cf = torch.bincount(c.long(), minlength=nc) + 1.  # frequency
+            # model._initialize_biases(cf.to(device))
+            if plots:
+                plot_labels(labels, names, save_dir)
+
+            # Anchors
+            if not opt.noautoanchor:
+                check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
+            model.half().float()  # pre-reduce anchor precision
+
+        callbacks.run('on_pretrain_routine_end')
+
+    # DDP mode
+    if cuda and RANK != -1:
+        model = DDP(model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK)
+
+    # Model attributes
+    nl = de_parallel(model).model[-1].nl  # number of detection layers (to scale hyps)
+    hyp['box'] *= 3 / nl  # scale to layers
+    hyp['cls'] *= nc / 80 * 3 / nl  # scale to classes and layers
+    hyp['obj'] *= (imgsz / 640) ** 2 * 3 / nl  # scale to image size and layers
+    hyp['label_smoothing'] = opt.label_smoothing
+    model.nc = nc  # attach number of classes to model
+    model.hyp = hyp  # attach hyperparameters to model
+    model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
+    model.names = names
+
+    results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
+    scheduler.last_epoch = start_epoch - 1  # do not move
+
+    LOGGER.info(f'Image sizes {imgsz} train, {imgsz} val\n'
+                f'Using {train_loader.num_workers * WORLD_SIZE} dataloader workers\n'
+                f"Logging results to {colorstr('bold', save_dir)}")
     
-    
-    #save dataset
-    # torch.save(train_dataset, "saved_data_loader/train_dataset.pth")
- 
+    #  save TRAIN -------------------------------------------------------------
+    pbar = enumerate(train_loader)
+    LOGGER.info("Storing train data into tensors")
+    if RANK in [-1, 0]:
+        pbar = tqdm(pbar, total=nb, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
+
+    last_idx = -1
+    for i, (imgs, targets, paths, shapes) in pbar:  
+        imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
+        torch.save(imgs, f"saved_tensors/train/imgs/{i}_imgs_train.pth") #save img
+        torch.save(targets, f"saved_tensors/train/targets/{i}_targets_train.pth") #save targets
+        with open(f"saved_tensors/train/paths/{i}_paths_train.pkl", "wb") as f: #save paths
+            pickle.dump(paths, f)
+        with open(f"saved_tensors/train/shapes/{i}_shapes_train.pkl", "wb") as f:
+            pickle.dump(shapes, f)
+        last_idx += 1
+    with open(f"saved_tensors/train/last_idx.txt", "w") as f:
+        f.write(str(last_idx))
+    # end save TRAIN ------------------------------------------------------------------------------------------------
+    last_idx = -1
+    LOGGER.info("Storing val data into tensors")
+    pbar = tqdm(val_loader, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
+    for i, (im, targets, paths, shapes) in enumerate(pbar):
+        im = im.to(device, non_blocking=True)
+        im = im.float()  # uint8 to fp16/32
+        im /= 255  # 0 - 255 to 0.0 - 1.0
+        targets = targets.to(device)
+        torch.save(im, f"saved_tensors/val/imgs/{i}_imgs_val.pth")
+        torch.save(targets, f"saved_tensors/val/targets/{i}_targets_val.pth")
+        with open(f"saved_tensors/val/paths/{i}_paths_val.pkl", "wb") as f:
+            pickle.dump(paths, f)
+        with open(f"saved_tensors/val/shapes/{i}_shapes_val.pkl", "wb") as f:
+            pickle.dump(shapes, f)
+        last_idx += 1
+    with open(f"saved_tensors/val/last_idx.txt", "w") as f:
+        f.write(str(last_idx))
+        
+    torch.cuda.empty_cache()
+    return results
 
 
 def parse_opt(known=False):
@@ -333,6 +410,93 @@ def main(opt, callbacks=Callbacks()):
             LOGGER.info('Destroying process group... ')
             dist.destroy_process_group()
 
+    # Evolve hyperparameters (optional)
+    else:
+        # Hyperparameter evolution metadata (mutation scale 0-1, lower_limit, upper_limit)
+        meta = {'lr0': (1, 1e-5, 1e-1),  # initial learning rate (SGD=1E-2, Adam=1E-3)
+                'lrf': (1, 0.01, 1.0),  # final OneCycleLR learning rate (lr0 * lrf)
+                'momentum': (0.3, 0.6, 0.98),  # SGD momentum/Adam beta1
+                'weight_decay': (1, 0.0, 0.001),  # optimizer weight decay
+                'warmup_epochs': (1, 0.0, 5.0),  # warmup epochs (fractions ok)
+                'warmup_momentum': (1, 0.0, 0.95),  # warmup initial momentum
+                'warmup_bias_lr': (1, 0.0, 0.2),  # warmup initial bias lr
+                'box': (1, 0.02, 0.2),  # box loss gain
+                'cls': (1, 0.2, 4.0),  # cls loss gain
+                'cls_pw': (1, 0.5, 2.0),  # cls BCELoss positive_weight
+                'obj': (1, 0.2, 4.0),  # obj loss gain (scale with pixels)
+                'obj_pw': (1, 0.5, 2.0),  # obj BCELoss positive_weight
+                'iou_t': (0, 0.1, 0.7),  # IoU training threshold
+                'anchor_t': (1, 2.0, 8.0),  # anchor-multiple threshold
+                'anchors': (2, 2.0, 10.0),  # anchors per output grid (0 to ignore)
+                'fl_gamma': (0, 0.0, 2.0),  # focal loss gamma (efficientDet default gamma=1.5)
+                'hsv_h': (1, 0.0, 0.1),  # image HSV-Hue augmentation (fraction)
+                'hsv_s': (1, 0.0, 0.9),  # image HSV-Saturation augmentation (fraction)
+                'hsv_v': (1, 0.0, 0.9),  # image HSV-Value augmentation (fraction)
+                'degrees': (1, 0.0, 45.0),  # image rotation (+/- deg)
+                'translate': (1, 0.0, 0.9),  # image translation (+/- fraction)
+                'scale': (1, 0.0, 0.9),  # image scale (+/- gain)
+                'shear': (1, 0.0, 10.0),  # image shear (+/- deg)
+                'perspective': (0, 0.0, 0.001),  # image perspective (+/- fraction), range 0-0.001
+                'flipud': (1, 0.0, 1.0),  # image flip up-down (probability)
+                'fliplr': (0, 0.0, 1.0),  # image flip left-right (probability)
+                'mosaic': (1, 0.0, 1.0),  # image mixup (probability)
+                'mixup': (1, 0.0, 1.0),  # image mixup (probability)
+                'copy_paste': (1, 0.0, 1.0)}  # segment copy-paste (probability)
+
+        with open(opt.hyp, errors='ignore') as f:
+            hyp = yaml.safe_load(f)  # load hyps dict
+            if 'anchors' not in hyp:  # anchors commented in hyp.yaml
+                hyp['anchors'] = 3
+        opt.noval, opt.nosave, save_dir = True, True, Path(opt.save_dir)  # only val/save final epoch
+        # ei = [isinstance(x, (int, float)) for x in hyp.values()]  # evolvable indices
+        evolve_yaml, evolve_csv = save_dir / 'hyp_evolve.yaml', save_dir / 'evolve.csv'
+        if opt.bucket:
+            os.system(f'gsutil cp gs://{opt.bucket}/evolve.csv {save_dir}')  # download evolve.csv if exists
+
+        for _ in range(opt.evolve):  # generations to evolve
+            if evolve_csv.exists():  # if evolve.csv exists: select best hyps and mutate
+                # Select parent(s)
+                parent = 'single'  # parent selection method: 'single' or 'weighted'
+                x = np.loadtxt(evolve_csv, ndmin=2, delimiter=',', skiprows=1)
+                n = min(5, len(x))  # number of previous results to consider
+                x = x[np.argsort(-fitness(x))][:n]  # top n mutations
+                w = fitness(x) - fitness(x).min() + 1E-6  # weights (sum > 0)
+                if parent == 'single' or len(x) == 1:
+                    # x = x[random.randint(0, n - 1)]  # random selection
+                    x = x[random.choices(range(n), weights=w)[0]]  # weighted selection
+                elif parent == 'weighted':
+                    x = (x * w.reshape(n, 1)).sum(0) / w.sum()  # weighted combination
+
+                # Mutate
+                mp, s = 0.8, 0.2  # mutation probability, sigma
+                npr = np.random
+                npr.seed(int(time.time()))
+                g = np.array([meta[k][0] for k in hyp.keys()])  # gains 0-1
+                ng = len(meta)
+                v = np.ones(ng)
+                while all(v == 1):  # mutate until a change occurs (prevent duplicates)
+                    v = (g * (npr.random(ng) < mp) * npr.randn(ng) * npr.random() * s + 1).clip(0.3, 3.0)
+                for i, k in enumerate(hyp.keys()):  # plt.hist(v.ravel(), 300)
+                    hyp[k] = float(x[i + 7] * v[i])  # mutate
+
+            # Constrain to limits
+            for k, v in meta.items():
+                hyp[k] = max(hyp[k], v[1])  # lower limit
+                hyp[k] = min(hyp[k], v[2])  # upper limit
+                hyp[k] = round(hyp[k], 5)  # significant digits
+
+            # Train mutation
+            results = train(hyp.copy(), opt, device, callbacks)
+
+            # Write mutation results
+            print_mutation(results, hyp.copy(), save_dir, opt.bucket)
+
+        # Plot results
+        plot_evolve(evolve_csv)
+        LOGGER.info(f'Hyperparameter evolution finished\n'
+                    f"Results saved to {colorstr('bold', save_dir)}\n"
+                    f'Use best hyperparameters example: $ python train.py --hyp {evolve_yaml}')
+
 
 def run(**kwargs):
     # Usage: import train; train.run(data='coco128.yaml', imgsz=320, weights='yolov5m.pt')
@@ -344,4 +508,15 @@ def run(**kwargs):
 
 if __name__ == "__main__":
     opt = parse_opt()
+    config = configparser.ConfigParser()
+    config.read(r"train.cfg")
+    default_conf = dict(config.items('DEFAULT'))
+    opt.imgsz = int(default_conf["imgsize"])
+    opt.batch = int(default_conf["batch"])
+    opt.epochs = int(default_conf["epochs"])
+    opt.data = str(default_conf["data"])
+    opt.weights = str(default_conf["weights"])
+    if torch.cuda.is_available():
+        opt.device = int(default_conf["device"])
+    opt.workers = int(default_conf["workers"])
     main(opt)
