@@ -28,6 +28,7 @@ storage.googleapis.com
 runs/*
 data/*
 data/images/*
+yolov5_evaluation/*
 !data/*.yaml
 !data/hyps
 !data/scripts
